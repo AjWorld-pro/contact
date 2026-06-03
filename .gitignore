@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+dist/
+build/
+
+# Environment
+.env
+*.db
+
+# Uploads
+uploads/profiles/*
+uploads/exports/*
+!uploads/profiles/.gitkeep
+!uploads/exports/.gitkeep
+
+# OS
+.DS_Store
+Thumbs.db
