@@ -11,6 +11,7 @@ from flask import Flask, jsonify, request, session, send_file, make_response
 from flask_cors import CORS
 from backend.config import Config
 from backend import utils
+import psycopg2.extras
 
 app = Flask(__name__, static_folder='../frontend', static_url_path='')
 app.config.from_object(Config)
@@ -31,8 +32,8 @@ def admin_required(f):
         if 'user_id' not in session:
             return jsonify({'error': 'Authentication required'}), 401
         conn = utils.get_db()
-        cur = conn.cursor()
-        cur.execute("SELECT role FROM users WHERE id = ?", [session['user_id']])
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT role FROM users WHERE id = %s", [session['user_id']])
         user = cur.fetchone()
         cur.close()
         conn.close()
@@ -57,17 +58,17 @@ def register():
     if not utils.validate_email(email):
         return jsonify({'error': 'Invalid email format'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE username = ? OR email = ?", [username, email])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id FROM users WHERE username = %s OR email = %s", [username, email])
     if cur.fetchone():
         cur.close(); conn.close()
         return jsonify({'error': 'Username or email already exists'}), 409
     password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
     cur.execute("""INSERT INTO users (username, email, password_hash, full_name, role)
-        VALUES (?, ?, ?, ?, 'user')""",
+        VALUES (%s, %s, %s, %s, 'user') RETURNING id""",
         [username, email, password_hash, full_name])
     conn.commit()
-    user_id = cur.lastrowid
+    user_id = cur.fetchone()['id']
     utils.log_activity(conn, user_id, 'register', 'user', user_id, 'User registered', utils.get_client_ip(request))
     cur.close(); conn.close()
     return jsonify({'message': 'Registration successful'}), 201
@@ -80,8 +81,8 @@ def login():
     if not username or not password:
         return jsonify({'error': 'Username and password required'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM users WHERE username = ? OR email = ?", [username, username])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM users WHERE username = %s OR email = %s", [username, username])
     user = cur.fetchone()
     if not user or not bcrypt.checkpw(password.encode(), user['password_hash'].encode()):
         cur.close(); conn.close()
@@ -89,7 +90,7 @@ def login():
     if not user['is_active']:
         cur.close(); conn.close()
         return jsonify({'error': 'Account is deactivated'}), 403
-    cur.execute("UPDATE users SET last_login = datetime('now') WHERE id = ?", [user['id']])
+    cur.execute("UPDATE users SET last_login = NOW() WHERE id = %s", [user['id']])
     conn.commit()
     session['user_id'] = user['id']
     session['role'] = user['role']
@@ -118,8 +119,8 @@ def logout():
 @login_required
 def get_current_user():
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id, username, email, full_name, role, profile_picture, is_active, email_verified, last_login, created_at FROM users WHERE id = ?", [session['user_id']])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id, username, email, full_name, role, profile_picture, is_active, email_verified, last_login, created_at FROM users WHERE id = %s", [session['user_id']])
     user = cur.fetchone()
     cur.close(); conn.close()
     if not user:
@@ -134,13 +135,13 @@ def forgot_password():
     if not email:
         return jsonify({'error': 'Email is required'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM users WHERE email = ?", [email])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id FROM users WHERE email = %s", [email])
     user = cur.fetchone()
     if user:
         token = secrets.token_urlsafe(48)
         expires = (datetime.utcnow() + timedelta(hours=1)).isoformat()
-        cur.execute("INSERT INTO password_resets (user_id, token, expires_at) VALUES (?, ?, ?)",
+        cur.execute("INSERT INTO password_resets (user_id, token, expires_at) VALUES (%s, %s, %s)",
                     [user['id'], token, expires])
         conn.commit()
     cur.close(); conn.close()
@@ -156,15 +157,15 @@ def reset_password():
     if len(password) < 6:
         return jsonify({'error': 'Password must be at least 6 characters'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM password_resets WHERE token = ? AND used = 0 AND expires_at > datetime('now')", [token])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM password_resets WHERE token = %s AND used = 0 AND expires_at > NOW()", [token])
     reset = cur.fetchone()
     if not reset:
         cur.close(); conn.close()
         return jsonify({'error': 'Invalid or expired token'}), 400
     password_hash = bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
-    cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", [password_hash, reset['user_id']])
-    cur.execute("UPDATE password_resets SET used = 1 WHERE id = ?", [reset['id']])
+    cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", [password_hash, reset['user_id']])
+    cur.execute("UPDATE password_resets SET used = 1 WHERE id = %s", [reset['id']])
     conn.commit()
     utils.log_activity(conn, reset['user_id'], 'password_reset', 'user', reset['user_id'], 'Password reset completed', utils.get_client_ip(request))
     cur.close(); conn.close()
@@ -181,14 +182,14 @@ def change_password():
     if len(new_password) < 6:
         return jsonify({'error': 'New password must be at least 6 characters'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT password_hash FROM users WHERE id = ?", [session['user_id']])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT password_hash FROM users WHERE id = %s", [session['user_id']])
     user = cur.fetchone()
     if not bcrypt.checkpw(current.encode(), user['password_hash'].encode()):
         cur.close(); conn.close()
         return jsonify({'error': 'Current password is incorrect'}), 400
     password_hash = bcrypt.hashpw(new_password.encode(), bcrypt.gensalt()).decode()
-    cur.execute("UPDATE users SET password_hash = ? WHERE id = ?", [password_hash, session['user_id']])
+    cur.execute("UPDATE users SET password_hash = %s WHERE id = %s", [password_hash, session['user_id']])
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'change_password', 'user', session['user_id'], 'Password changed', utils.get_client_ip(request))
     cur.close(); conn.close()
@@ -200,7 +201,7 @@ def change_password():
 @login_required
 def get_contacts():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     user_id = session['user_id']
     page = request.args.get('page', 1, type=int)
     per_page = request.args.get('per_page', Config.PAGINATION_PER_PAGE, type=int)
@@ -216,27 +217,27 @@ def get_contacts():
     sort_dir = 'ASC' if sort_order.lower() == 'asc' else 'DESC'
     if session.get('role') == 'admin' and request.args.get('user_id'):
         user_id = request.args.get('user_id', type=int)
-    base_query = "FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id WHERE c.user_id = ?"
+    base_query = "FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id WHERE c.user_id = %s"
     params = [user_id]
     if trashed == '1':
         base_query += " AND c.is_deleted = 1"
     else:
         base_query += " AND c.is_deleted = 0"
     if search:
-        base_query += " AND (c.full_name LIKE ? OR c.phone LIKE ? OR c.email LIKE ? OR c.company LIKE ?)"
+        base_query += " AND (c.full_name LIKE %s OR c.phone LIKE %s OR c.email LIKE %s OR c.company LIKE %s)"
         s = f"%{search}%"
         params.extend([s, s, s, s])
     if category:
-        base_query += " AND c.category_id = ?"
+        base_query += " AND c.category_id = %s"
         params.append(category)
     if favorite is not None:
-        base_query += " AND c.is_favorite = ?"
+        base_query += " AND c.is_favorite = %s"
         params.append(favorite)
     cur.execute(f"SELECT COUNT(*) as total {base_query}", params)
     total = cur.fetchone()['total']
     offset = (page - 1) * per_page
     cur.execute(f"""SELECT c.*, cat.name as category_name, cat.color as category_color
-        {base_query} ORDER BY c.{sort_by} {sort_dir}, c.id DESC LIMIT ? OFFSET ?""",
+        {base_query} ORDER BY c.{sort_by} {sort_dir}, c.id DESC LIMIT %s OFFSET %s""",
         params + [per_page, offset])
     contacts = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
@@ -250,7 +251,7 @@ def create_contact():
     if not full_name:
         return jsonify({'error': 'Full name is required'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     dup = utils.check_duplicate_contact(conn, session['user_id'], full_name,
                                         data.get('phone'), data.get('email'))
     if dup:
@@ -258,17 +259,17 @@ def create_contact():
         return jsonify({'error': 'Duplicate contact detected', 'duplicate_id': dup['id']}), 409
     cur.execute("""INSERT INTO contacts (user_id, full_name, phone, email, address,
         company, job_title, category_id, birthday, notes, is_favorite)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
         [session['user_id'], full_name, data.get('phone'), data.get('email'),
          data.get('address'), data.get('company'), data.get('job_title'),
          data.get('category_id'),
          data.get('birthday') if data.get('birthday') else None,
          data.get('notes'), data.get('is_favorite', 0)])
     conn.commit()
-    contact_id = cur.lastrowid
+    contact_id = cur.fetchone()['id']
     utils.log_activity(conn, session['user_id'], 'create', 'contact', contact_id,
                        f'Created contact: {full_name}', utils.get_client_ip(request))
-    cur.execute("SELECT c.*, cat.name as category_name, cat.color as category_color FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id WHERE c.id = ?", [contact_id])
+    cur.execute("SELECT c.*, cat.name as category_name, cat.color as category_color FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id WHERE c.id = %s", [contact_id])
     contact = dict(cur.fetchone())
     cur.close(); conn.close()
     return jsonify({'message': 'Contact created', 'contact': contact}), 201
@@ -277,9 +278,9 @@ def create_contact():
 @login_required
 def get_contact(contact_id):
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""SELECT c.*, cat.name as category_name, cat.color as category_color
-        FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id WHERE c.id = ?""", [contact_id])
+        FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id WHERE c.id = %s""", [contact_id])
     contact = cur.fetchone()
     cur.close(); conn.close()
     if not contact:
@@ -292,8 +293,8 @@ def get_contact(contact_id):
 @login_required
 def update_contact(contact_id):
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM contacts WHERE id = ?", [contact_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM contacts WHERE id = %s", [contact_id])
     contact = cur.fetchone()
     if not contact:
         cur.close(); conn.close()
@@ -310,9 +311,9 @@ def update_contact(contact_id):
     if dup:
         cur.close(); conn.close()
         return jsonify({'error': 'Duplicate contact detected', 'duplicate_id': dup['id']}), 409
-    cur.execute("""UPDATE contacts SET full_name=?, phone=?, email=?, address=?,
-        company=?, job_title=?, category_id=?, birthday=?, notes=?, is_favorite=?,
-        updated_at=datetime('now') WHERE id=?""",
+    cur.execute("""UPDATE contacts SET full_name=%s, phone=%s, email=%s, address=%s,
+        company=%s, job_title=%s, category_id=%s, birthday=%s, notes=%s, is_favorite=%s,
+        updated_at=NOW() WHERE id=%s""",
         [full_name, data.get('phone', contact['phone']),
          data.get('email', contact['email']),
          data.get('address', contact['address']),
@@ -326,7 +327,7 @@ def update_contact(contact_id):
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'update', 'contact', contact_id,
                        f'Updated contact: {full_name}', utils.get_client_ip(request))
-    cur.execute("SELECT c.*, cat.name as category_name, cat.color as category_color FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id WHERE c.id = ?", [contact_id])
+    cur.execute("SELECT c.*, cat.name as category_name, cat.color as category_color FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id WHERE c.id = %s", [contact_id])
     updated = dict(cur.fetchone())
     cur.close(); conn.close()
     return jsonify({'message': 'Contact updated', 'contact': updated})
@@ -335,8 +336,8 @@ def update_contact(contact_id):
 @login_required
 def delete_contact(contact_id):
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM contacts WHERE id = ?", [contact_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM contacts WHERE id = %s", [contact_id])
     contact = cur.fetchone()
     if not contact:
         cur.close(); conn.close()
@@ -344,7 +345,7 @@ def delete_contact(contact_id):
     if contact['user_id'] != session['user_id'] and session.get('role') != 'admin':
         cur.close(); conn.close()
         return jsonify({'error': 'Access denied'}), 403
-    cur.execute("UPDATE contacts SET is_deleted = 1, deleted_at = datetime('now') WHERE id = ?", [contact_id])
+    cur.execute("UPDATE contacts SET is_deleted = 1, deleted_at = NOW() WHERE id = %s", [contact_id])
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'soft_delete', 'contact', contact_id,
                        f'Moved contact to trash: {contact["full_name"]}', utils.get_client_ip(request))
@@ -355,8 +356,8 @@ def delete_contact(contact_id):
 @login_required
 def restore_contact(contact_id):
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM contacts WHERE id = ? AND is_deleted = 1", [contact_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM contacts WHERE id = %s AND is_deleted = 1", [contact_id])
     contact = cur.fetchone()
     if not contact:
         cur.close(); conn.close()
@@ -364,7 +365,7 @@ def restore_contact(contact_id):
     if contact['user_id'] != session['user_id'] and session.get('role') != 'admin':
         cur.close(); conn.close()
         return jsonify({'error': 'Access denied'}), 403
-    cur.execute("UPDATE contacts SET is_deleted = 0, deleted_at = NULL WHERE id = ?", [contact_id])
+    cur.execute("UPDATE contacts SET is_deleted = 0, deleted_at = NULL WHERE id = %s", [contact_id])
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'restore', 'contact', contact_id,
                        f'Restored contact: {contact["full_name"]}', utils.get_client_ip(request))
@@ -375,8 +376,8 @@ def restore_contact(contact_id):
 @login_required
 def hard_delete_contact(contact_id):
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM contacts WHERE id = ?", [contact_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT * FROM contacts WHERE id = %s", [contact_id])
     contact = cur.fetchone()
     if not contact:
         cur.close(); conn.close()
@@ -384,7 +385,7 @@ def hard_delete_contact(contact_id):
     if contact['user_id'] != session['user_id'] and session.get('role') != 'admin':
         cur.close(); conn.close()
         return jsonify({'error': 'Access denied'}), 403
-    cur.execute("DELETE FROM contacts WHERE id = ?", [contact_id])
+    cur.execute("DELETE FROM contacts WHERE id = %s", [contact_id])
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'hard_delete', 'contact', contact_id,
                        f'Permanently deleted contact: {contact["full_name"]}', utils.get_client_ip(request))
@@ -395,14 +396,14 @@ def hard_delete_contact(contact_id):
 @login_required
 def toggle_favorite(contact_id):
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT is_favorite FROM contacts WHERE id = ?", [contact_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT is_favorite FROM contacts WHERE id = %s", [contact_id])
     contact = cur.fetchone()
     if not contact:
         cur.close(); conn.close()
         return jsonify({'error': 'Contact not found'}), 404
     new_val = 0 if contact['is_favorite'] else 1
-    cur.execute("UPDATE contacts SET is_favorite = ? WHERE id = ?", [new_val, contact_id])
+    cur.execute("UPDATE contacts SET is_favorite = %s WHERE id = %s", [new_val, contact_id])
     conn.commit()
     cur.close(); conn.close()
     return jsonify({'message': 'Favorite updated', 'is_favorite': new_val})
@@ -413,7 +414,7 @@ def toggle_favorite(contact_id):
 @login_required
 def get_categories():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT c.*, (SELECT COUNT(*) FROM contacts WHERE category_id = c.id AND is_deleted = 0) as contact_count FROM categories c ORDER BY c.name")
     categories = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
@@ -427,15 +428,15 @@ def create_category():
     if not name:
         return jsonify({'error': 'Category name is required'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT id FROM categories WHERE name = ?", [name])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT id FROM categories WHERE name = %s", [name])
     if cur.fetchone():
         cur.close(); conn.close()
         return jsonify({'error': 'Category already exists'}), 409
-    cur.execute("INSERT INTO categories (name, color, icon, created_by) VALUES (?, ?, ?, ?)",
+    cur.execute("INSERT INTO categories (name, color, icon, created_by) VALUES (%s, %s, %s, %s) RETURNING id",
                 [name, data.get('color', '#10B981'), data.get('icon', 'folder'), session['user_id']])
     conn.commit()
-    cat_id = cur.lastrowid
+    cat_id = cur.fetchone()['id']
     utils.log_activity(conn, session['user_id'], 'create', 'category', cat_id, f'Created category: {name}', utils.get_client_ip(request))
     cur.close(); conn.close()
     return jsonify({'message': 'Category created', 'id': cat_id}), 201
@@ -445,8 +446,8 @@ def create_category():
 def update_category(cat_id):
     data = request.get_json()
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE categories SET name=?, color=?, icon=? WHERE id=?",
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("UPDATE categories SET name=%s, color=%s, icon=%s WHERE id=%s",
                 [data.get('name'), data.get('color'), data.get('icon'), cat_id])
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'update', 'category', cat_id, f'Updated category', utils.get_client_ip(request))
@@ -457,9 +458,9 @@ def update_category(cat_id):
 @login_required
 def delete_category(cat_id):
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE contacts SET category_id = NULL WHERE category_id = ?", [cat_id])
-    cur.execute("DELETE FROM categories WHERE id = ?", [cat_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("UPDATE contacts SET category_id = NULL WHERE category_id = %s", [cat_id])
+    cur.execute("DELETE FROM categories WHERE id = %s", [cat_id])
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'delete', 'category', cat_id, f'Deleted category', utils.get_client_ip(request))
     cur.close(); conn.close()
@@ -471,13 +472,13 @@ def delete_category(cat_id):
 @login_required
 def export_contacts(fmt):
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     user_id = session['user_id']
     if session.get('role') == 'admin' and request.args.get('user_id'):
         user_id = int(request.args.get('user_id'))
     cur.execute("""SELECT c.*, cat.name as category_name FROM contacts c
         LEFT JOIN categories cat ON c.category_id = cat.id
-        WHERE c.user_id = ? AND c.is_deleted = 0 ORDER BY c.full_name""", [user_id])
+        WHERE c.user_id = %s AND c.is_deleted = 0 ORDER BY c.full_name""", [user_id])
     contacts = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     if fmt == 'csv':
@@ -549,7 +550,7 @@ def import_contacts():
 def update_profile():
     data = request.get_json()
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     full_name = data.get('full_name', '').strip()
     email = data.get('email', '').strip().lower()
     if not full_name or not email:
@@ -558,11 +559,11 @@ def update_profile():
     if not utils.validate_email(email):
         cur.close(); conn.close()
         return jsonify({'error': 'Invalid email'}), 400
-    cur.execute("SELECT id FROM users WHERE email = ? AND id != ?", [email, session['user_id']])
+    cur.execute("SELECT id FROM users WHERE email = %s AND id != %s", [email, session['user_id']])
     if cur.fetchone():
         cur.close(); conn.close()
         return jsonify({'error': 'Email already in use'}), 409
-    cur.execute("UPDATE users SET full_name=?, email=?, updated_at=datetime('now') WHERE id=?", [full_name, email, session['user_id']])
+    cur.execute("UPDATE users SET full_name=%s, email=%s, updated_at=NOW() WHERE id=%s", [full_name, email, session['user_id']])
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'update_profile', 'user', session['user_id'], 'Profile updated', utils.get_client_ip(request))
     cur.close(); conn.close()
@@ -578,8 +579,8 @@ def upload_profile_picture():
     if not filename:
         return jsonify({'error': 'Invalid file type'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET profile_picture = ? WHERE id = ?", [filename, session['user_id']])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("UPDATE users SET profile_picture = %s WHERE id = %s", [filename, session['user_id']])
     conn.commit()
     cur.close(); conn.close()
     return jsonify({'message': 'Picture uploaded', 'filename': filename})
@@ -594,8 +595,8 @@ def upload_contact_picture(contact_id):
     if not filename:
         return jsonify({'error': 'Invalid file type'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE contacts SET profile_picture = ? WHERE id = ?", [filename, contact_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("UPDATE contacts SET profile_picture = %s WHERE id = %s", [filename, contact_id])
     conn.commit()
     cur.close(); conn.close()
     return jsonify({'message': 'Picture uploaded', 'filename': filename})
@@ -610,7 +611,7 @@ def serve_profile(filename):
 @admin_required
 def admin_stats():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT COUNT(*) as total FROM users")
     total_users = cur.fetchone()['total']
     cur.execute("SELECT COUNT(*) as total FROM contacts WHERE is_deleted = 0")
@@ -621,25 +622,25 @@ def admin_stats():
     favorite_contacts = cur.fetchone()['total']
     cur.execute("SELECT COUNT(*) as total FROM activity_logs")
     total_activities = cur.fetchone()['total']
-    cur.execute("SELECT COUNT(*) as total FROM users WHERE created_at >= datetime('now', '-30 days')")
+    cur.execute("SELECT COUNT(*) as total FROM users WHERE created_at >= NOW() - INTERVAL '30 days'")
     new_users_30d = cur.fetchone()['total']
-    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE created_at >= datetime('now', '-30 days') AND is_deleted = 0")
+    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE created_at >= NOW() - INTERVAL '30 days' AND is_deleted = 0")
     new_contacts_30d = cur.fetchone()['total']
     cur.execute("""SELECT COUNT(*) as total FROM contacts
         WHERE is_deleted = 0 AND birthday IS NOT NULL
-        AND strftime('%m-%d', birthday) = strftime('%m-%d', 'now')""")
+        AND TO_CHAR(birthday, 'MM-DD') = TO_CHAR(CURRENT_DATE, 'MM-DD')""")
     birthdays_today = cur.fetchone()['total']
     cur.execute("""SELECT COUNT(*) as total FROM contacts
         WHERE is_deleted = 0 AND birthday IS NOT NULL
-        AND strftime('%m', birthday) = strftime('%m', 'now')""")
+        AND EXTRACT(MONTH FROM birthday) = EXTRACT(MONTH FROM CURRENT_DATE)""")
     birthdays_this_month = cur.fetchone()['total']
     cur.execute("""SELECT cat.name, COUNT(c.id) as count FROM categories cat
         LEFT JOIN contacts c ON c.category_id = cat.id AND c.is_deleted = 0
         GROUP BY cat.id, cat.name ORDER BY count DESC""")
     category_stats = [dict(r) for r in cur.fetchall()]
-    cur.execute("""SELECT date(created_at) as date, COUNT(*) as count
-        FROM contacts WHERE is_deleted = 0 AND created_at >= datetime('now', '-30 days')
-        GROUP BY date(created_at) ORDER BY date""")
+    cur.execute("""SELECT created_at::date as date, COUNT(*) as count
+        FROM contacts WHERE is_deleted = 0 AND created_at >= NOW() - INTERVAL '30 days'
+        GROUP BY created_at::date ORDER BY date""")
     contact_growth = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     return jsonify({
@@ -655,20 +656,20 @@ def admin_stats():
 @admin_required
 def admin_get_users():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     page = request.args.get('page', 1, type=int)
     per_page = 20
     search = request.args.get('search', '').strip()
     query = "FROM users"
     params = []
     if search:
-        query += " WHERE username LIKE ? OR email LIKE ? OR full_name LIKE ?"
+        query += " WHERE username LIKE %s OR email LIKE %s OR full_name LIKE %s"
         s = f"%{search}%"
         params.extend([s, s, s])
     cur.execute(f"SELECT COUNT(*) as total {query}", params)
     total = cur.fetchone()['total']
     offset = (page - 1) * per_page
-    cur.execute(f"SELECT id, username, email, full_name, role, is_active, last_login, created_at {query} ORDER BY created_at DESC LIMIT ? OFFSET ?", params + [per_page, offset])
+    cur.execute(f"SELECT id, username, email, full_name, role, is_active, last_login, created_at {query} ORDER BY created_at DESC LIMIT %s OFFSET %s", params + [per_page, offset])
     users = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     return jsonify({'users': users, 'total': total, 'page': page})
@@ -681,8 +682,8 @@ def admin_update_user_role(user_id):
     if role not in ('admin', 'user'):
         return jsonify({'error': 'Invalid role'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("UPDATE users SET role = ?, updated_at=datetime('now') WHERE id = ?", [role, user_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("UPDATE users SET role = %s, updated_at=NOW() WHERE id = %s", [role, user_id])
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'change_role', 'user', user_id,
                        f'Changed user role to {role}', utils.get_client_ip(request))
@@ -693,14 +694,14 @@ def admin_update_user_role(user_id):
 @admin_required
 def admin_toggle_user_active(user_id):
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("SELECT is_active FROM users WHERE id = ?", [user_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("SELECT is_active FROM users WHERE id = %s", [user_id])
     user = cur.fetchone()
     if not user:
         cur.close(); conn.close()
         return jsonify({'error': 'User not found'}), 404
     new_status = 0 if user['is_active'] else 1
-    cur.execute("UPDATE users SET is_active = ? WHERE id = ?", [new_status, user_id])
+    cur.execute("UPDATE users SET is_active = %s WHERE id = %s", [new_status, user_id])
     conn.commit()
     action = 'Activated' if new_status else 'Deactivated'
     utils.log_activity(conn, session['user_id'], 'toggle_active', 'user', user_id,
@@ -714,9 +715,9 @@ def admin_delete_user(user_id):
     if user_id == session['user_id']:
         return jsonify({'error': 'Cannot delete yourself'}), 400
     conn = utils.get_db()
-    cur = conn.cursor()
-    cur.execute("DELETE FROM contacts WHERE user_id = ?", [user_id])
-    cur.execute("DELETE FROM users WHERE id = ?", [user_id])
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    cur.execute("DELETE FROM contacts WHERE user_id = %s", [user_id])
+    cur.execute("DELETE FROM users WHERE id = %s", [user_id])
     conn.commit()
     utils.log_activity(conn, session['user_id'], 'delete_user', 'user', user_id,
                        'Deleted user', utils.get_client_ip(request))
@@ -727,20 +728,20 @@ def admin_delete_user(user_id):
 @admin_required
 def admin_get_activities():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     page = request.args.get('page', 1, type=int)
     per_page = 30
     action_filter = request.args.get('action', '')
     query = "FROM activity_logs al LEFT JOIN users u ON al.user_id = u.id"
     params = []
     if action_filter:
-        query += " WHERE al.action = ?"
+        query += " WHERE al.action = %s"
         params.append(action_filter)
     cur.execute(f"SELECT COUNT(*) as total {query}", params)
     total = cur.fetchone()['total']
     offset = (page - 1) * per_page
     cur.execute(f"""SELECT al.*, u.username, u.full_name as user_full_name
-        {query} ORDER BY al.created_at DESC LIMIT ? OFFSET ?""", params + [per_page, offset])
+        {query} ORDER BY al.created_at DESC LIMIT %s OFFSET %s""", params + [per_page, offset])
     activities = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     return jsonify({'activities': activities, 'total': total, 'page': page})
@@ -749,13 +750,13 @@ def admin_get_activities():
 @admin_required
 def admin_birthdays():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""SELECT c.*, u.username as owner, cat.name as category_name
         FROM contacts c JOIN users u ON c.user_id = u.id
         LEFT JOIN categories cat ON c.category_id = cat.id
         WHERE c.is_deleted = 0 AND c.birthday IS NOT NULL
-        AND strftime('%m', c.birthday) = strftime('%m', 'now')
-        ORDER BY strftime('%d', c.birthday)""")
+        AND EXTRACT(MONTH FROM c.birthday) = EXTRACT(MONTH FROM CURRENT_DATE)
+        ORDER BY EXTRACT(DAY FROM c.birthday)""")
     birthdays = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     return jsonify({'birthdays': birthdays})
@@ -764,7 +765,7 @@ def admin_birthdays():
 @admin_required
 def admin_dashboard_data():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""SELECT u.id, u.username, u.full_name, u.role, u.is_active, u.created_at,
         (SELECT COUNT(*) FROM contacts WHERE user_id = u.id AND is_deleted = 0) as contact_count,
         (SELECT COUNT(*) FROM activity_logs WHERE user_id = u.id) as activity_count
@@ -782,7 +783,7 @@ def admin_dashboard_data():
     cur.execute("""SELECT c.full_name, c.birthday, u.username as owner
         FROM contacts c JOIN users u ON c.user_id = u.id
         WHERE c.is_deleted = 0 AND c.birthday IS NOT NULL
-        AND strftime('%m-%d', c.birthday) = strftime('%m-%d', 'now')""")
+        AND TO_CHAR(c.birthday, 'MM-DD') = TO_CHAR(CURRENT_DATE, 'MM-DD')""")
     todays_birthdays = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
     return jsonify({
@@ -794,7 +795,7 @@ def admin_dashboard_data():
 @admin_required
 def admin_activity_actions():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("SELECT DISTINCT action FROM activity_logs ORDER BY action")
     actions = [r['action'] for r in cur.fetchall()]
     cur.close(); conn.close()
@@ -806,12 +807,12 @@ def admin_activity_actions():
 @login_required
 def upcoming_birthdays():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     days = request.args.get('days', 7, type=int)
     cur.execute("""SELECT c.*, cat.name as category_name, cat.color as category_color
         FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id
-        WHERE c.user_id = ? AND c.is_deleted = 0 AND c.birthday IS NOT NULL
-        ORDER BY strftime('%m-%d', c.birthday)""", [session['user_id']])
+        WHERE c.user_id = %s AND c.is_deleted = 0 AND c.birthday IS NOT NULL
+        ORDER BY TO_CHAR(c.birthday, 'MM-DD')""", [session['user_id']])
     all_birthdays = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
 
@@ -838,17 +839,17 @@ def upcoming_birthdays():
 @login_required
 def user_dashboard_stats():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     uid = session['user_id']
-    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = ? AND is_deleted = 0", [uid])
+    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = %s AND is_deleted = 0", [uid])
     total_contacts = cur.fetchone()['total']
-    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = ? AND is_deleted = 0 AND is_favorite = 1", [uid])
+    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = %s AND is_deleted = 0 AND is_favorite = 1", [uid])
     favorite_count = cur.fetchone()['total']
-    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = ? AND is_deleted = 1", [uid])
+    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = %s AND is_deleted = 1", [uid])
     trashed_count = cur.fetchone()['total']
-    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = ? AND is_deleted = 0 AND birthday IS NOT NULL AND strftime('%m', birthday) = strftime('%m', 'now')", [uid])
+    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = %s AND is_deleted = 0 AND birthday IS NOT NULL AND EXTRACT(MONTH FROM birthday) = EXTRACT(MONTH FROM CURRENT_DATE)", [uid])
     birthdays_month = cur.fetchone()['total']
-    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = ? AND is_deleted = 0 AND strftime('%m', created_at) = strftime('%m', 'now') AND strftime('%Y', created_at) = strftime('%Y', 'now')", [uid])
+    cur.execute("SELECT COUNT(*) as total FROM contacts WHERE user_id = %s AND is_deleted = 0 AND EXTRACT(MONTH FROM created_at) = EXTRACT(MONTH FROM CURRENT_DATE) AND EXTRACT(YEAR FROM created_at) = EXTRACT(YEAR FROM CURRENT_DATE)", [uid])
     added_this_month = cur.fetchone()['total']
     cur.close(); conn.close()
     return jsonify({
@@ -861,11 +862,11 @@ def user_dashboard_stats():
 @login_required
 def user_dashboard_recent():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     uid = session['user_id']
     cur.execute("""SELECT c.*, cat.name as category_name, cat.color as category_color
         FROM contacts c LEFT JOIN categories cat ON c.category_id = cat.id
-        WHERE c.user_id = ? AND c.is_deleted = 0
+        WHERE c.user_id = %s AND c.is_deleted = 0
         ORDER BY c.updated_at DESC LIMIT 5""", [uid])
     recent = [dict(r) for r in cur.fetchall()]
     cur.close(); conn.close()
@@ -877,7 +878,7 @@ def user_dashboard_recent():
 @admin_required
 def get_backups():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     cur.execute("""SELECT b.*, u.username FROM backups b
         LEFT JOIN users u ON b.user_id = u.id ORDER BY b.created_at DESC""")
     backups = [dict(r) for r in cur.fetchall()]
@@ -888,7 +889,7 @@ def get_backups():
 @admin_required
 def create_backup():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     filename = f"backup_full_{timestamp}.sql"
     filepath = os.path.join(Config.EXPORT_FOLDER, filename)
@@ -909,10 +910,10 @@ def create_backup():
         cur.execute("SELECT COUNT(*) as total FROM contacts WHERE is_deleted = 0")
         total = cur.fetchone()['total']
         cur.execute("""INSERT INTO backups (user_id, filename, filepath, size_bytes, type, records_count)
-            VALUES (?, ?, ?, ?, 'full', ?)""",
+            VALUES (%s, %s, %s, %s, 'full', %s) RETURNING id""",
             [session['user_id'], filename, filepath, filesize, total])
         conn.commit()
-        utils.log_activity(conn, session['user_id'], 'create_backup', 'backup', cur.lastrowid,
+        utils.log_activity(conn, session['user_id'], 'create_backup', 'backup', cur.fetchone()['id'],
                            f'Created backup: {filename}', utils.get_client_ip(request))
         cur.close(); conn.close()
         return jsonify({'message': 'Backup created', 'filename': filename, 'size': filesize})
@@ -923,20 +924,20 @@ def create_backup():
 @admin_required
 def admin_report_summary():
     conn = utils.get_db()
-    cur = conn.cursor()
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     period = request.args.get('period', 'month')
     interval_map = {'week': '-7 days', 'month': '-30 days', 'year': '-1 years'}
     interval = interval_map.get(period, '-30 days')
-    cur.execute(f"""SELECT date(created_at) as date, COUNT(*) as registrations
-        FROM users WHERE created_at >= datetime('now', ?)
-        GROUP BY date(created_at) ORDER BY date""", [interval])
+    cur.execute(f"""SELECT created_at::date as date, COUNT(*) as registrations
+        FROM users WHERE created_at >= NOW() - %s::interval
+        GROUP BY created_at::date ORDER BY date""", [interval])
     user_registrations = [dict(r) for r in cur.fetchall()]
-    cur.execute(f"""SELECT date(created_at) as date, COUNT(*) as contacts_added
-        FROM contacts WHERE created_at >= datetime('now', ?) AND is_deleted = 0
-        GROUP BY date(created_at) ORDER BY date""", [interval])
+    cur.execute(f"""SELECT created_at::date as date, COUNT(*) as contacts_added
+        FROM contacts WHERE created_at >= NOW() - %s::interval AND is_deleted = 0
+        GROUP BY created_at::date ORDER BY date""", [interval])
     contacts_added = [dict(r) for r in cur.fetchall()]
     cur.execute("""SELECT action, COUNT(*) as count FROM activity_logs
-        WHERE created_at >= datetime('now', '-30 days')
+        WHERE created_at >= NOW() - INTERVAL '30 days'
         GROUP BY action ORDER BY count DESC""")
     action_counts = [dict(r) for r in cur.fetchall()]
     cur.execute("""SELECT u.username, u.full_name, COUNT(c.id) as contact_count

@@ -2,26 +2,41 @@ import os
 import csv
 import io
 import re
-import sqlite3
-from datetime import datetime, timedelta
+import psycopg2
+import psycopg2.extras
+from datetime import datetime, timedelta, date
 from PIL import Image
 from backend.config import Config
 import openpyxl
 from io import BytesIO
 
 def get_db():
-    conn = sqlite3.connect(Config.DATABASE)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    conn = psycopg2.connect(Config.DATABASE_URL, sslmode='require')
+    conn.autocommit = False
     return conn
+
+def serialize(obj):
+    if isinstance(obj, (datetime, date)):
+        return obj.isoformat()
+    return obj
+
+def row_to_dict(row):
+    if row is None:
+        return None
+    d = dict(row)
+    for k, v in d.items():
+        d[k] = serialize(v)
+    return d
+
+def rows_to_list(rows):
+    return [row_to_dict(r) for r in rows]
 
 def init_db():
     conn = get_db()
     cur = conn.cursor()
-    cur.executescript('''
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             username TEXT UNIQUE NOT NULL,
             email TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
@@ -30,88 +45,90 @@ def init_db():
             is_active INTEGER DEFAULT 1,
             profile_picture TEXT DEFAULT NULL,
             email_verified INTEGER DEFAULT 0,
-            last_login TEXT DEFAULT NULL,
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now'))
-        );
-
+            last_login TIMESTAMP DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS categories (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             color TEXT DEFAULT '#10B981',
             icon TEXT DEFAULT 'folder',
-            created_by INTEGER,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE SET NULL
-        );
-
+            created_by INTEGER REFERENCES users(id) ON DELETE SET NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS contacts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             full_name TEXT NOT NULL,
             phone TEXT DEFAULT NULL,
             email TEXT DEFAULT NULL,
             address TEXT DEFAULT NULL,
             company TEXT DEFAULT NULL,
             job_title TEXT DEFAULT NULL,
-            category_id INTEGER DEFAULT NULL,
-            birthday TEXT DEFAULT NULL,
+            category_id INTEGER REFERENCES categories(id) ON DELETE SET NULL,
+            birthday DATE DEFAULT NULL,
             notes TEXT DEFAULT NULL,
             profile_picture TEXT DEFAULT NULL,
             is_favorite INTEGER DEFAULT 0,
             is_deleted INTEGER DEFAULT 0,
-            deleted_at TEXT DEFAULT NULL,
-            created_at TEXT DEFAULT (datetime('now')),
-            updated_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
-            FOREIGN KEY (category_id) REFERENCES categories(id) ON DELETE SET NULL
-        );
-
+            deleted_at TIMESTAMP DEFAULT NULL,
+            created_at TIMESTAMP DEFAULT NOW(),
+            updated_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS activity_logs (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER REFERENCES users(id) ON DELETE SET NULL,
             action TEXT NOT NULL,
             entity_type TEXT NOT NULL,
             entity_id INTEGER DEFAULT NULL,
             details TEXT DEFAULT NULL,
             ip_address TEXT DEFAULT NULL,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
-        );
-
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS password_resets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             token TEXT NOT NULL,
-            expires_at TEXT NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
             used INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS backups (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
             filename TEXT NOT NULL,
             filepath TEXT NOT NULL,
             size_bytes INTEGER DEFAULT 0,
-            type TEXT DEFAULT 'full' CHECK(type IN ('csv', 'excel', 'pdf', 'full')),
+            type TEXT DEFAULT 'full',
             records_count INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT (datetime('now')),
-            FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id);
-        CREATE INDEX IF NOT EXISTS idx_contacts_category ON contacts(category_id);
-        CREATE INDEX IF NOT EXISTS idx_contacts_deleted ON contacts(is_deleted);
-        CREATE INDEX IF NOT EXISTS idx_contacts_favorite ON contacts(is_favorite);
-        CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(user_id);
-        CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_logs(action);
-        CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_logs(created_at);
-    ''')
+            created_at TIMESTAMP DEFAULT NOW()
+        )
+    """)
+    indexes = [
+        "CREATE INDEX IF NOT EXISTS idx_contacts_user ON contacts(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_category ON contacts(category_id)",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_deleted ON contacts(is_deleted)",
+        "CREATE INDEX IF NOT EXISTS idx_contacts_favorite ON contacts(is_favorite)",
+        "CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_activity_action ON activity_logs(action)",
+        "CREATE INDEX IF NOT EXISTS idx_activity_created ON activity_logs(created_at)",
+    ]
+    for idx in indexes:
+        cur.execute(idx)
 
     cur.execute("SELECT COUNT(*) as cnt FROM categories")
-    if cur.fetchone()['cnt'] == 0:
+    if cur.fetchone()[0] == 0:
         defaults = [
             ('Family', '#059669', 'users'),
             ('Friends', '#3B82F6', 'heart'),
@@ -120,23 +137,24 @@ def init_db():
             ('School', '#EC4899', 'graduation-cap'),
             ('Healthcare', '#EF4444', 'heartbeat')
         ]
-        cur.executemany("INSERT INTO categories (name, color, icon) VALUES (?, ?, ?)", defaults)
+        cur.executemany("INSERT INTO categories (name, color, icon) VALUES (%s, %s, %s)", defaults)
 
     conn.commit()
+    cur.close()
     conn.close()
-    print("  Database initialized successfully")
+    print("  Database initialized (PostgreSQL)")
 
 def seed_default_admin():
     import bcrypt
     conn = get_db()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) as cnt FROM users")
-    if cur.fetchone()['cnt'] == 0:
+    if cur.fetchone()[0] == 0:
         admin_hash = bcrypt.hashpw(b'admin123', bcrypt.gensalt(rounds=4)).decode()
         user_hash = bcrypt.hashpw(b'user123', bcrypt.gensalt(rounds=4)).decode()
-        cur.execute("INSERT INTO users (username, email, password_hash, full_name, role, is_active, email_verified) VALUES (?, ?, ?, ?, 'admin', 1, 1)",
+        cur.execute("INSERT INTO users (username, email, password_hash, full_name, role, is_active, email_verified) VALUES (%s, %s, %s, %s, 'admin', 1, 1)",
                     ['admin', 'admin@contactpro.com', admin_hash, 'Administrator'])
-        cur.execute("INSERT INTO users (username, email, password_hash, full_name, role, is_active) VALUES (?, ?, ?, ?, 'user', 1)",
+        cur.execute("INSERT INTO users (username, email, password_hash, full_name, role, is_active) VALUES (%s, %s, %s, %s, 'user', 1)",
                     ['user', 'user@contactpro.com', user_hash, 'User'])
         conn.commit()
         print("  Default accounts created: admin / admin123, user / user123")
@@ -179,18 +197,18 @@ def save_contact_picture(file, contact_id):
     return None
 
 def check_duplicate_contact(conn, user_id, full_name, phone=None, email=None, exclude_id=None):
-    cur = conn.cursor()
-    query = "SELECT id FROM contacts WHERE user_id = ? AND is_deleted = 0 AND (full_name = ?"
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+    query = "SELECT id FROM contacts WHERE user_id = %s AND is_deleted = 0 AND (full_name = %s"
     params = [user_id, full_name]
     if phone:
-        query += " OR phone = ?"
+        query += " OR phone = %s"
         params.append(phone)
     if email:
-        query += " OR email = ?"
+        query += " OR email = %s"
         params.append(email)
     query += ")"
     if exclude_id:
-        query += " AND id != ?"
+        query += " AND id != %s"
         params.append(exclude_id)
     cur.execute(query, params)
     result = cur.fetchone()
@@ -253,10 +271,10 @@ def import_from_csv(file_stream, user_id, conn):
             category_name = row.get('Category', '').strip()
             category_id = None
             if category_name:
-                cur.execute("SELECT id FROM categories WHERE name = ?", [category_name])
+                cur.execute("SELECT id FROM categories WHERE name = %s", [category_name])
                 cat = cur.fetchone()
                 if cat:
-                    category_id = cat['id']
+                    category_id = cat[0]
             birthday = None
             bd = row.get('Birthday', '').strip()
             if bd:
@@ -268,7 +286,7 @@ def import_from_csv(file_stream, user_id, conn):
                         pass
             cur.execute("""INSERT INTO contacts (user_id, full_name, phone, email, address,
                 company, job_title, category_id, birthday, notes, is_favorite)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
                 [user_id, full_name, phone, email,
                  row.get('Address', '').strip() or None,
                  row.get('Company', '').strip() or None,
@@ -291,7 +309,7 @@ def get_client_ip(request):
 def log_activity(conn, user_id, action, entity_type, entity_id=None, details=None, ip_address=None):
     cur = conn.cursor()
     cur.execute("""INSERT INTO activity_logs (user_id, action, entity_type, entity_id, details, ip_address)
-        VALUES (?, ?, ?, ?, ?, ?)""",
+        VALUES (%s, %s, %s, %s, %s, %s)""",
         [user_id, action, entity_type, entity_id, details, ip_address])
     conn.commit()
     cur.close()
